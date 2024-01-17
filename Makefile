@@ -14,31 +14,43 @@
 # along with this program; see the file COPYING. If not see
 # <http://www.gnu.org/licenses/>.
 
+PS5_HOST ?= ps5
+PS5_PORT ?= 9021
 
-LOADER  := elfldr.elf
-PAYLOAD := payload.elf
+ifndef PS5_PAYLOAD_SDK
+    $(error PS5_PAYLOAD_SDK is undefined)
+endif
 
-CC := clang
-LD := ld.lld
+PATH := $(PATH):$(PS5_PAYLOAD_SDK)/host
 
-CFLAGS := -Wall
+CC  := x86_64-ps5-payload-cc
+LD  := x86_64-ps5-payload-ld
+XXD := xxd
 
-all: $(LOADER) $(PAYLOAD)
+CFLAGS := -std=gnu11 -Wall -fno-plt
+LDADD  := -lSceLibcInternal -lkernel_sys
 
-$(LOADER): main.c elfldr.c
-	$(CC) -o $@ $^
+all: bootstrap.elf elfldr.elf
+
+libc.o: libc.c
+	$(CC) -c $(CFLAGS) -fno-builtin -o $@ $<
 
 %.o: %.c
-	$(CC) -c $(CFLAGS) -ffreestanding -fno-builtin -nostdlib -fPIC -o $@ $<
+	$(CC) -c $(CFLAGS) -o $@ $<
 
-$(PAYLOAD): payload.o libtest.so
-	$(LD) -pie -ltest -lc -L./ -L/usr/lib/x86_64-linux-gnu/ -T elf_x86_64.x -o $@ $^
+main-bootstrap.c: elfldr_elf.c
 
-libtest.so: libtest.c
-	$(CC) $(CFLAGS) -ffreestanding -fno-builtin -nostdlib -fPIC -fpie -shared -o $@ $^
+elfldr_elf.c: elfldr.elf
+	$(XXD) -i $^ > $@
 
-test: $(LOADER) $(PAYLOAD)
-	./$(LOADER) ./$(PAYLOAD)
+elfldr.elf: main.o elfldr.o rtld.o libc.o
+	$(LD) -o $@ $^
+
+bootstrap.elf: main-bootstrap.o bootstrap.o pt.o libc.o
+	$(LD) -o $@ $^
+
+test: bootstrap.elf
+	nc -q0 $(PS5_HOST) $(PS5_PORT) < $^
 
 clean:
-	rm -f *.o *.elf *.so
+	rm -f *.o elfldr_elf.c *.elf

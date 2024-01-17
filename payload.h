@@ -14,7 +14,16 @@ You should have received a copy of the GNU General Public License
 along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
+#pragma once
 
-int test(void) {
-  return 42;
-}
+typedef struct payload_args {
+  int (*sceKernelDlsym)(int, const char*, void*);
+
+  int rwpipe[2];
+  int rwpair[2];
+
+  unsigned long kpipe_addr;
+  unsigned long kdata_base_addr;
+
+  int payloadout[1];
+} payload_args_t;

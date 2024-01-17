@@ -17,5 +17,5 @@ along with this program; see the file COPYING. If not, see
 
 #pragma once
 
+int elfldr_serve(uint16_t port);
 int elfldr_exec(unsigned char *elf, unsigned int size);
-

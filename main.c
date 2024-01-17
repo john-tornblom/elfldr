@@ -14,54 +14,42 @@ You should have received a copy of the GNU General Public License
 along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
-
+#include <pthread.h>
 #include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
+#include <unistd.h>
+
+#include <ps5/kernel.h>
 
 #include "elfldr.h"
 
 
+static void*
+main_thread(void* args) {
+  while(1) {
+    elfldr_serve(9023);
+  }
+  return 0;
+}
+
+
 int
 main(int argc, char** argv, char** envp) {
-  FILE* file;
-  long len;
+  uint8_t privcaps[16] = {0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+                          0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff};
+  pid_t pid = getpid();
+  uint8_t caps[16];
+  pthread_t trd;
 
-  if(!(file=fopen(argv[1], "rb"))) {
-    perror("fopen");
-    return 1;
+  if(kernel_get_ucred_caps(pid, caps)) {
+    puts("[elfldr.elf] kernel_get_ucred_caps() failed");
+    return -1;
   }
 
-  if(fseek(file, 0, SEEK_END)) {
-    perror("fseek");
-    return 1;
+  if(kernel_set_ucred_caps(pid, privcaps)) {
+    puts("[elfldr.elf] kernel_set_ucred_caps() failed");
+    return -1;
   }
-
-  if((len=ftell(file)) < 0) {
-    perror("ftell");
-    return 1;
-  }
-
-  if(fseek(file, 0, SEEK_SET)) {
-    perror("fseek");
-    return 1;
-  }
-
-  unsigned char buf[len];
-  if(fread(buf, 1, len, file) != len) {
-    perror("fread");
-    return 1;
-  }
-
-  if(fclose(file)) {
-    perror("fclose");
-    return 1;
-  }
-
-  if(elfldr_exec(buf, len) < 0) {
-    return 1;
-  }
-
-  return 0;
+  return elfldr_serve(9023);
+  return pthread_create(&trd, 0, main_thread, 0);
 }
 

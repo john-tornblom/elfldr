@@ -14,17 +14,26 @@ You should have received a copy of the GNU General Public License
 along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
-
+#include <stdarg.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <libelf.h>
-#include <sys/mman.h>
-#include <sys/user.h>
-#include <dlfcn.h>
-#include <errno.h>
-#include <stdlib.h>
-#include <limits.h>
 #include <unistd.h>
+#include <stdlib.h>
+
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/user.h>
+
+#include <ps5/kernel.h>
+
+#include <elf.h>
+
+#include "payload.h"
+#include "rtld.h"
 
 
 /**
@@ -38,16 +47,6 @@ along with this program; see the file COPYING. If not, see
 
 
 /**
- * Linked list of dependencies to shared libraries.
- **/
-typedef struct elfldr_needed {
-  const char*           filename;
-  void*                 handle;
-  struct elfldr_needed* next;
-} elfldr_needed_t;
-
-
-/**
  * Context structure for the ELF loader.
  **/
 typedef struct elfldr_ctx {
@@ -58,36 +57,86 @@ typedef struct elfldr_ctx {
   void*  base_addr;
   size_t base_size;
 
-  elfldr_needed_t *needed;
+  rtld_lib_t *libseq;
 } elfldr_ctx_t;
 
 
 /**
- * Search paths for share libraries.
+ * Create shared memory.
  **/
-static const char*
-LD_LIBRARY_PATH[] = {
-  "./",
-  "/usr/lib/",
-  "/usr/lib/x86_64-linux-gnu/"
-};
-
-
-/**
- * Log an error.
- **/
-static void
-logerr(const char* msg, int error) {
-  fprintf(stderr, "[elfldr.elf] %s: %s\n", msg, strerror(error));
+static int
+jitshm_create(char* name, size_t size, int flags) {
+  return (int)syscall(0x215, name, size, flags, 0, 0, 0);
 }
 
 
 /**
- * Log a debug message.
+ * Create an alias for some shared memory.
  **/
-static void
-logdbg(const char* msg) {
-  fprintf(stdout, "[elfldr.elf] %s\n", msg);
+static int
+jitshm_alias(int fd, int flags) {
+  return (int)syscall(0x216, fd, flags, 0, 0, 0, 0);
+}
+
+
+/**
+ * Reload a PT_LOAD program header with executable permissions.
+ **/
+static int
+pt_reload(elfldr_ctx_t *ctx, Elf64_Phdr *phdr) {
+  void* addr = ctx->base_addr + phdr->p_vaddr;
+  size_t memsz = ROUND_PG(phdr->p_memsz);
+  int prot = PFLAGS(phdr->p_flags);
+  int alias_fd = -1;
+  int shm_fd = -1;
+  void* data = 0;
+  int error = 0;
+
+  if(!(data=malloc(memsz))) {
+    perror("[elfldr.elf] malloc");
+    return -1;
+  }
+  
+  // Backup data
+  memcpy(data, addr, memsz);
+  
+  // Create shm with executable permissions.
+  if((shm_fd=jitshm_create(0, memsz, prot | PROT_WRITE)) < 0) {
+    perror("[elfldr.elf] jitshm_create");
+    error = -1;
+  }
+
+  // Map shm into an executable address space.
+  else if((addr=mmap(addr, memsz, prot, MAP_FIXED | MAP_SHARED,
+		shm_fd, 0)) == MAP_FAILED) {
+    perror("[elfldr.elf] mmap");
+    error = -1;
+  }
+
+  // Create an shm alias fd with write permissions.
+  else if((alias_fd=jitshm_alias(shm_fd, PROT_WRITE)) < 0) {
+    perror("[elfldr.elf] jitshm_alias");
+    error = -1;
+  }
+
+  // Map shm alias into a writable address space.
+  else if((addr=mmap(0, memsz, PROT_WRITE, MAP_SHARED,
+		alias_fd, 0)) == MAP_FAILED) {
+    perror("[elfldr.elf] mmap");
+    error = -1;
+  }
+
+  // Resore data
+  else {
+    memcpy(addr, data, phdr->p_memsz);
+    munmap(addr, memsz);
+  }
+
+  free(data);
+  close(alias_fd);  
+  close(shm_fd);
+
+  return error;
 }
 
 
@@ -96,15 +145,16 @@ logdbg(const char* msg) {
  **/
 static int
 pt_load(elfldr_ctx_t *ctx, Elf64_Phdr *phdr) {
-  void* vaddr = ctx->base_addr + phdr->p_vaddr;
+  void* addr = ctx->base_addr + phdr->p_vaddr;
+  size_t memsz = ROUND_PG(phdr->p_memsz);
 
-  if(!phdr->p_memsz || !phdr->p_filesz) {
-    return 0;
+  if((addr=mmap(addr, memsz, PROT_WRITE | PROT_READ,
+		MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE,
+		-1, 0)) == MAP_FAILED) {
+    perror("[elfldr.elf] mmap");
+    return -1;
   }
-
-  memcpy(ctx->base_addr + phdr->p_vaddr,
-	 ctx->elf + phdr->p_offset,
-	 phdr->p_filesz);
+  memcpy(addr, ctx->elf+phdr->p_offset, phdr->p_memsz);
 
   return 0;
 }
@@ -131,7 +181,7 @@ pt_dynamic(elfldr_ctx_t *ctx, Elf64_Phdr *phdr) {
     }
   }
 
-  return 0;
+  return pt_load(ctx, phdr);
 }
 
 
@@ -140,27 +190,15 @@ pt_dynamic(elfldr_ctx_t *ctx, Elf64_Phdr *phdr) {
  **/
 static int
 dt_needed(elfldr_ctx_t *ctx, const char* basename) {
-  elfldr_needed_t *needed;
-  char filename[PATH_MAX];
-  void* handle = 0;
+  rtld_lib_t* lib;
 
-  for(int i=0; i<sizeof(LD_LIBRARY_PATH)/sizeof(LD_LIBRARY_PATH[0]); i++) {
-    sprintf(filename, "%s/%s", LD_LIBRARY_PATH[i], basename);
-    if((handle=dlopen(filename, RTLD_NOW))) {
-      break;
-    }
-  }
-
-  if(!handle) {
+  if(!(lib=rtld_open(basename))) {
+    printf("[elfldr.elf] Unable to open '%s'\n", basename);
     return -1;
   }
 
-  needed           = calloc(1, sizeof(elfldr_needed_t));
-  needed->filename = filename;
-  needed->handle   = handle;
-  needed->next     = ctx->needed;
-
-  ctx->needed = needed;
+  lib->next = ctx->libseq;
+  ctx->libseq = lib;
 
   return 0;
 }
@@ -171,9 +209,10 @@ dt_needed(elfldr_ctx_t *ctx, const char* basename) {
 **/
 static int
 r_relative(elfldr_ctx_t *ctx, Elf64_Rela* rela) {
-  Elf64_Addr* value_addr = (ctx->base_addr + rela->r_offset);
+  void* loc = ctx->base_addr + rela->r_offset;
+  void* val = ctx->base_addr + rela->r_addend;
 
-  *value_addr = (Elf64_Addr)ctx->base_addr + rela->r_addend;
+  *(intptr_t*)loc = (intptr_t)val;
 
   return 0;
 }
@@ -185,20 +224,76 @@ r_relative(elfldr_ctx_t *ctx, Elf64_Rela* rela) {
 static int
 r_jmp_slot(elfldr_ctx_t *ctx, Elf64_Rela* rela) {
   Elf64_Sym* sym = ctx->symtab + ELF64_R_SYM(rela->r_info);
-  Elf64_Addr* value_addr = ctx->base_addr + rela->r_offset;
-  char* name = ctx->strtab + sym->st_name;
+  const char* name = ctx->strtab + sym->st_name;
+  void* loc = ctx->base_addr + rela->r_offset;
+  void* val = 0;
 
-  for(elfldr_needed_t *n=ctx->needed; n!=NULL; n=n->next) {
-    if((*value_addr=(Elf64_Addr)dlsym(n->handle, name))) {
+  for(rtld_lib_t *lib=ctx->libseq; lib!=0; lib=lib->next) {
+    if((val=rtld_sym(lib, name))) {
+      *(intptr_t*)loc = (intptr_t)val;
       return 0;
     }
   }
+
+  printf("[elfldr.elf] Unable to resolve '%s'\n", name);
 
   return -1;
 }
 
 
-int
+/**
+* Parse a R_X86_64_GLOB_DAT relocatable.
+**/
+static int
+r_glob_dat(elfldr_ctx_t *ctx, Elf64_Rela* rela) {
+  Elf64_Sym* sym = ctx->symtab + ELF64_R_SYM(rela->r_info);
+  const char* name = ctx->strtab + sym->st_name;
+  void* loc = ctx->base_addr + rela->r_offset;
+  void* val = 0;
+
+  for(rtld_lib_t *lib=ctx->libseq; lib!=0; lib=lib->next) {
+    if((val=rtld_sym(lib, name))) {
+      *(intptr_t*)loc = (intptr_t)val;
+      return 0;
+    }
+  }
+
+  printf("[elfldr.elf] Unable to resolve '%s'\n", name);
+
+  return -1;
+}
+
+
+/**
+ * Spawn a new process and jump to the given entry point.
+ **/
+static pid_t
+elfldr_spawn(void* entry) {
+  long (*_start)(void*) = entry;
+  char procname[255];
+  pid_t pid = 0;
+
+  if((pid=syscall(SYS_rfork, RFPROC | RFNOWAIT)) < 0) {
+    perror("[elfldr.elf] rfork");
+    return -1;
+  }
+
+  if(!pid) {
+    sprintf(procname, "payload-%d.elf", getpid());
+    syscall(0x1d0, -1, procname);
+    syscall(SYS_setsid);
+    _start(0);
+    syscall(SYS_exit, 0);
+  }
+
+  return pid;
+}
+
+
+/**
+ * Execute the given ELF in a new process.
+ **/
+pid_t
 elfldr_exec(uint8_t* elf, size_t size) {
   Elf64_Ehdr* ehdr = (Elf64_Ehdr*)elf;
   Elf64_Phdr* phdr = (Elf64_Phdr*)(elf + ehdr->e_phoff);
@@ -208,22 +303,18 @@ elfldr_exec(uint8_t* elf, size_t size) {
   size_t min_vaddr = -1;
   size_t max_vaddr = 0;
 
+  pid_t pid = -1;
   int error = 0;
-  pid_t pid;
-
+  
   // Sanity check, we only support 64bit ELFs.
   if(ehdr->e_ident[0] != 0x7f || ehdr->e_ident[1] != 'E' ||
      ehdr->e_ident[2] != 'L'  || ehdr->e_ident[3] != 'F') {
-    logerr("ehdr->e_ident", ENOEXEC);
-    return ENOEXEC;
+    puts("[elfldr.elf] Malformed ELF file");
+    return -1;
   }
 
   // Compute size of virtual memory region.
   for(int i=0; i<ehdr->e_phnum; i++) {
-    if(phdr[i].p_type != PT_LOAD || phdr[i].p_memsz == 0) {
-      continue;
-    }
-
     if(phdr[i].p_vaddr < min_vaddr) {
       min_vaddr = phdr[i].p_vaddr;
     }
@@ -245,15 +336,15 @@ elfldr_exec(uint8_t* elf, size_t size) {
     ctx.base_addr = (void*)min_vaddr;
     flags |= MAP_FIXED;
   } else {
-    logerr("ehdr->e_type", ENOEXEC);
-    return ENOEXEC;
+    puts("[elfldr.elf] ELF type not supported");
+    return -1;
   }
 
   // Reserve an address space of sufficient size.
   if((ctx.base_addr=mmap(ctx.base_addr, ctx.base_size,
-			 prot, flags, -1, 0)) == (void*)-1) {
-    logerr("mmap", errno);
-    return errno;
+			 prot, flags, -1, 0)) == MAP_FAILED) {
+    perror("[elfldr.elf] mmap");
+    return -1;
   }
 
   // Parse program headers.
@@ -282,7 +373,7 @@ elfldr_exec(uint8_t* elf, size_t size) {
     }
   }
 
-  // Relocate positional independent symbols.
+  // Apply relocations.
   for(int i=0; i<ehdr->e_shnum && !error; i++) {
     if(shdr[i].sh_type != SHT_RELA) {
       continue;
@@ -293,11 +384,15 @@ elfldr_exec(uint8_t* elf, size_t size) {
 
       switch(rela[j].r_info & 0xffffffffl) {
       case R_X86_64_RELATIVE:
-	r_relative(&ctx, &rela[j]);
+	error = r_relative(&ctx, &rela[j]);
 	break;
 
-      case R_X86_64_JUMP_SLOT:
-	r_jmp_slot(&ctx, &rela[j]);
+      case R_X86_64_JMP_SLOT:
+	error = r_jmp_slot(&ctx, &rela[j]);
+	break;
+
+      case R_X86_64_GLOB_DAT:
+	error = r_glob_dat(&ctx, &rela[j]);
 	break;
       }
     }
@@ -309,34 +404,141 @@ elfldr_exec(uint8_t* elf, size_t size) {
       continue;
     }
 
-    if(mprotect(ctx.base_addr + phdr[i].p_vaddr,
-		ROUND_PG(phdr[i].p_memsz),
-		PFLAGS(phdr[i].p_flags))) {
-      logerr("mprotect", errno);
-      error = 1;
-      break;
+    if(phdr[i].p_flags & PF_X) {
+      error = pt_reload(&ctx, &phdr[i]);
+
+    } else {
+      if(mprotect(ctx.base_addr + phdr[i].p_vaddr,
+		  ROUND_PG(phdr[i].p_memsz),
+		  PFLAGS(phdr[i].p_flags))) {
+	error = 1;
+	perror("[elfldr.elf] mprotect");
+      }
     }
   }
 
-  // Spawn a new process if the ELF was loaded successfully.
   if(!error) {
-    void (*_start)() = ctx.base_addr + ehdr->e_entry;
-    if(!(pid=fork())) {
-      _start();
-      exit(0);
-    }
+    pid = elfldr_spawn(ctx.base_addr + ehdr->e_entry);
+  }
+
+  while(ctx.libseq) {
+    rtld_lib_t *next = ctx.libseq->next;
+    rtld_close(ctx.libseq);
+    ctx.libseq = next;
   }
 
   if(munmap(ctx.base_addr, ctx.base_size)) {
-    logerr("munmap", errno);
+    perror("[elfldr.elf] munmap");
+    error = 1;
   }
-
-  //TODO: free ctx members
 
   if(error) {
     return -1;
   }
 
   return pid;
+}
+
+
+/**
+ * Read an ELF from a given socket connection.
+ **/
+static ssize_t
+elfldr_read(int connfd, uint8_t **data) {
+  uint8_t buf[0x4000];
+  off_t offset = 0;
+  ssize_t len;
+
+  *data = 0;
+  while((len=read(connfd, buf, sizeof(buf)))) {
+    *data = realloc(*data, offset + len);
+    if(*data == 0) {
+      perror("[elfldr.elf] realloc");
+      return -1;
+    }
+
+    memcpy(*data + offset, buf, len);
+    offset += len;
+  }
+
+  return offset;
+}
+
+
+/**
+ * Accept ELF payloads from the given port.
+ **/
+int
+elfldr_serve(uint16_t port) {
+  struct sockaddr_in server_addr;
+  struct sockaddr_in client_addr;
+  socklen_t addr_len;
+
+  int stdout_fd;
+  int stderr_fd;
+
+  uint8_t *elf;
+  size_t size;
+
+  int connfd;
+  int srvfd;
+
+  if((srvfd=socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+    perror("[elfldr.elf] socket");
+    return -1;
+  }
+
+  if(setsockopt(srvfd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int)) < 0) {
+    perror("[elfldr.elf] setsockopt");
+    close(srvfd);
+    return -1;
+  }
+
+  memset(&server_addr, 0, sizeof(server_addr));
+  server_addr.sin_family = AF_INET;
+  server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  server_addr.sin_port = htons(port);
+
+  if(bind(srvfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) != 0) {
+    perror("[elfldr.elf] bind");
+    close(srvfd);
+    return -1;
+  }
+
+  if(listen(srvfd, 5) != 0) {
+    perror("[elfldr.elf] listen");
+    close(srvfd);
+    return -1;
+  }
+
+  stdout_fd = dup(1);
+  stderr_fd = dup(2);
+
+  while(1) {
+    addr_len = sizeof(client_addr);
+    if((connfd=accept(srvfd, (struct sockaddr*)&client_addr, &addr_len)) < 0) {
+      perror("[elfldr.elf] accept");
+      close(connfd);
+      close(srvfd);
+      return -1;
+    }
+
+    // We got a connection, read ELF and launch it in the given process.
+    if((size=elfldr_read(connfd, &elf))) {
+      dup2(connfd, 1);
+      dup2(connfd, 2);
+
+      elfldr_exec(elf, size);
+      free(elf);
+
+      dup2(stdout_fd, 1);
+      dup2(stderr_fd, 2);
+    }
+    close(connfd);
+    break;
+  }
+  close(srvfd);
+
+  return 0;
 }
 

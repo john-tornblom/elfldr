@@ -14,23 +14,7 @@ You should have received a copy of the GNU General Public License
 along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
-
-#include <stdio.h>
-
-#include "libtest.h"
+#include <unistd.h>
 
 
-static char* strings[] = {
-  "ABCD",
-  "EFGH",
-  "IJKL",
-  "MNOP"
-};
-
-
-void
-_start() {
-  printf("test() = %d\n", test());
-  printf("strings[2][2] = %c\n", strings[2][2]);
-}
-
+int bootstrap_exec(pid_t pid, uint8_t *elf, size_t size);
